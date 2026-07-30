@@ -1,0 +1,6 @@
+-- Per-service minimum staffing configuration (SOW §11). Additive + idempotent.
+ALTER TABLE "Service" ADD COLUMN IF NOT EXISTS "minSupportStaff" INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE "Service" ADD COLUMN IF NOT EXISTS "minDrivers" INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE "Service" ADD COLUMN IF NOT EXISTS "ratioParticipantsPer" INTEGER;
+ALTER TABLE "Service" ADD COLUMN IF NOT EXISTS "ratioSupportStaff" INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE "Service" ADD COLUMN IF NOT EXISTS "ratioDrivers" INTEGER NOT NULL DEFAULT 0;

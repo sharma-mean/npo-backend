@@ -1,0 +1,44 @@
+{
+  "name": "npo-backend-new",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "NODE_ENV=test node --test test/*.test.js",
+    "start": "nodemon src/server.js",
+    "dev": "nodemon src/server.js",
+    "cron": "node -e \"require('./src/cron/scheduler').runDailySweep().then(r=>{console.log(JSON.stringify(r));process.exit(0)}).catch(e=>{console.error(e);process.exit(1)})\"",
+    "seed": "node prisma/seeders/index.js",
+    "seed:full": "node prisma/seed-full.js",
+    "build": "prisma generate",
+    "postinstall": "prisma generate",
+    "push": "git add . && git commit -m 'Update' && git push"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1085.0",
+    "@aws-sdk/s3-request-presigner": "^3.1085.0",
+    "@prisma/client": "^5.22.0",
+    "bcrypt": "^6.0.0",
+    "bcryptjs": "^3.0.3",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "ejs": "^5.0.2",
+    "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.3",
+    "node-cron": "^4.5.0",
+    "nodemailer": "^8.0.8",
+    "pug": "^3.0.4",
+    "stripe": "^22.3.1",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.14",
+    "prisma": "^5.22.0"
+  },
+  "prisma": {
+    "seed": "node prisma/seed-full.js"
+  }
+}

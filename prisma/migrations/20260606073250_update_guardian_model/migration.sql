@@ -1,0 +1,9 @@
+-- AlterTable
+ALTER TABLE "Guardian" ALTER COLUMN "address" DROP NOT NULL,
+ALTER COLUMN "city" DROP NOT NULL,
+ALTER COLUMN "state" DROP NOT NULL,
+ALTER COLUMN "country" DROP NOT NULL,
+ALTER COLUMN "postalCode" DROP NOT NULL;
+
+-- AlterTable
+ALTER TABLE "Participant" ADD COLUMN     "address" TEXT;

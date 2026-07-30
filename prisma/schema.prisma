@@ -1,0 +1,1076 @@
+generator client {
+  provider      = "prisma-client-js"
+  // "native" for local dev; "rhel-openssl-3.0.x" is the AWS Lambda / Vercel
+  // serverless runtime engine. Without it the query engine is missing in prod.
+  binaryTargets = ["native", "rhel-openssl-3.0.x"]
+}
+
+datasource db {
+  provider  = "postgresql"
+  // url       = runtime connection (pgbouncer/transaction pooler on Supabase).
+  // directUrl = unpooled connection used ONLY by `prisma migrate`/`db push`.
+  // On self-hosted EC2 Postgres, set both env vars to the same standard URL.
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// SubscriptionPlan
+// Billing cadence. Client pricing: yearly is simply monthly × 12 (no discount).
+enum PlanInterval {
+  MONTHLY
+  YEARLY
+}
+
+model SubscriptionPlan {
+  id              String       @id @default(uuid())
+  name            String
+  nameJa          String? // Japanese display name (ベーシック…)
+  interval        PlanInterval @default(MONTHLY)
+  durationDays    Int
+  price           Float // TAX-EXCLUSIVE — 10% Japanese consumption tax is added on top
+  currency        String       @default("JPY") // display currency (client pricing is ¥)
+  maxUsers        Int // staff-side seat cap (NPO_ADMIN/COORDINATOR/STAFF)
+  maxParticipants Int? // participant cap (client plans are participant-based); null = unlimited
+  features        String[]     @default([]) // marketing feature list shown on plan cards
+  isRecommended   Boolean      @default(false)
+  isActive        Boolean      @default(true)
+
+  // Custom Plan (client: triggers at 71+ active participants). Priced per-head
+  // instead of a flat amount.
+  //
+  // `pricePerParticipant` is always the MONTHLY rate per participant, on both the
+  // MONTHLY and the YEARLY row — a YEARLY custom plan charges it × 12, exactly as
+  // a standard yearly plan is its monthly price × 12. Storing a different number
+  // on the yearly row is how this silently under-charged by 12×; the multiplier
+  // now lives in `computePlanAmount`, which reads the interval.
+  isCustom            Boolean @default(false)
+  pricePerParticipant Float? // ¥2000/participant/MONTH (tax-exclusive)
+
+  // Stripe mirror — created lazily by ensureStripePrice() and cached here so we
+  // never re-create a Price for the same plan. A Stripe Price is immutable, so
+  // changing `price` mints a NEW price id (the old one stays for existing subs).
+  stripeProductId String?
+  stripePriceId   String?
+
+  createdAt BigInt
+  updatedAt BigInt
+
+  subscriptions OrganizationSubscription[]
+}
+
+enum ServiceType {
+  MOBILITY
+  RECREATION
+  DAYCARE
+}
+
+enum StaffRoleType {
+  DRIVER
+  SUPPORT_WORKER
+  ASSISTANT
+  HELPER
+  CHEF
+  MAID
+  VOLUNTEER
+  TEMPORARY
+  COORDINATOR
+  NURSE
+  ACTIVITY_LEADER
+  OTHER
+}
+
+// Organization
+// Map/geocoding provider. OSM = free, no key, works out of the box. GOOGLE =
+// the org brings its OWN API key, so Google's usage bill is theirs.
+enum MapProvider {
+  OSM
+  GOOGLE
+}
+
+enum OrganizationStatus {
+  ACTIVE
+  PENDING
+  INACTIVE
+  BLOCKED
+}
+
+model Organization {
+  id         String @id @default(uuid())
+  name       String
+  code       String @unique
+  email      String @unique
+  phone      String
+  address    String
+  city       String
+  state      String
+  country    String
+  postalCode String
+
+  status    OrganizationStatus @default(PENDING)
+  isDeleted Boolean            @default(false)
+
+  // Org brand logo as a data-URL (shown top-right in the header)
+  brandLogo String?
+
+  // Monotonic counters for human-friendly codes, incremented atomically:
+  // bookings (BK0001), staff (S001), participants (P001).
+  bookingSeq     Int @default(0)
+  staffSeq       Int @default(0)
+  participantSeq Int @default(0)
+
+  // Booking reminder intervals in hours before start (admin-configurable,
+  // multiple allowed: e.g. [168, 48, 24] = 1 week + 48h + 24h).
+  reminderHours Int[] @default([24])
+
+  // Qualified-invoice registration number (適格請求書発行事業者登録番号, "T"+13
+  // digits) that THIS org prints on the receipts/invoices it issues. Per-org and
+  // admin-editable because the platform serves many orgs, each with its own
+  // number — it is NOT a single platform-wide value (client feedback #4).
+  taxRegistrationNumber String?
+
+  // Maps: OSM is the default so a new org works with zero setup and zero cost.
+  // An org that wants Google's accuracy/routing supplies its OWN API key — the
+  // Google bill then lands on that org, not on us across every tenant.
+  mapProvider      MapProvider @default(OSM)
+  googleMapsApiKey String? // secret: only ever returned to this org's own users
+
+  createdAt BigInt
+  updatedAt BigInt
+
+  subscriptions       OrganizationSubscription[]
+  users               User[]
+  staffRoles          StaffRole[]
+  vehicles            Vehicle[]
+  venues              Venue[]
+  bookings            Booking[]
+  staffAssignments    BookingStaffAssignment[]
+  staffAttendances    StaffAttendance[]
+  service             Service[]
+  serviceSlots        ServiceSlot[]
+  incidents           Incident[]
+  auditLogs           AuditLog[]
+  staffAvailabilities StaffAvailability[]
+  notifications       Notification[]
+  invoices            Invoice[]
+  vehicleOperations   VehicleOperation[]
+  documents           Document[]
+  deviceTokens        DeviceToken[]
+  dailyReports        DailyReport[]
+
+  // Stripe customer — created once per org, reused for every checkout so the
+  // customer's saved cards / billing history stay together.
+  stripeCustomerId String?
+}
+
+// OrganizationSubscription
+enum SubscriptionStatus {
+  TRIALING
+  // Konbini / bank-transfer checkouts are ASYNC: the customer leaves with a
+  // voucher and pays at a store days later. The subscription sits here until
+  // Stripe's async_payment_succeeded webhook lands — it is NOT usable yet.
+  PENDING_PAYMENT
+  ACTIVE
+  PAST_DUE
+  EXPIRED
+  CANCELLED
+}
+
+// How the current period was paid for. Only CARD can auto-renew — konbini and
+// bank transfer are push methods, so those subscriptions must be renewed by the
+// customer each period (autoRenew is forced false for them).
+enum PaymentMethodType {
+  CARD
+  KONBINI
+  BANK_TRANSFER
+}
+
+model OrganizationSubscription {
+  id             String             @id @default(uuid())
+  organizationId String
+  organization   Organization       @relation(fields: [organizationId], references: [id])
+  planId         String
+  plan           SubscriptionPlan   @relation(fields: [planId], references: [id])
+  startAt        BigInt
+  endAt          BigInt
+  status         SubscriptionStatus @default(ACTIVE)
+
+  // Billing snapshot + audit ("who took what plan when")
+  planName   String?
+  amount     Float?
+  paymentRef String?
+  isTrial    Boolean @default(false)
+  createdBy  String?
+
+  // Stripe linkage. stripeSubscriptionId is only set for CARD (recurring);
+  // konbini/bank-transfer periods are one-off PaymentIntents, so they have a
+  // checkout session + payment intent but no Stripe Subscription object.
+  stripeSubscriptionId String?
+  stripeSessionId      String?
+  paymentMethod        PaymentMethodType?
+
+  // Lifecycle controls
+  autoRenew         Boolean @default(true)
+  cancelAtPeriodEnd Boolean @default(false)
+
+  // Automatic participant-based upgrade (Use Cases 35–37). When a konbini/bank
+  // org crosses a plan cap, the higher plan is applied PROVISIONALLY while a
+  // prorated invoice is pending: `provisionalPlanId` is the target, `previousPlanId`
+  // the one to roll back to, `provisionalUntil` the 3-day grace deadline, and
+  // `provisionalInvoiceRef` the Stripe invoice/PI awaiting payment. Card upgrades
+  // are immediate (Stripe proration) and don't use these.
+  provisionalPlanId     String?
+  previousPlanId        String?
+  provisionalUntil      BigInt?
+  provisionalInvoiceRef String?
+  // Set when a provisional upgrade was reverted for non-payment — while set and
+  // the org is over its plan cap, new participant adds are BLOCKED (client:
+  // "restrict excess participant activity") and auto-upgrade won't re-provision.
+  // Cleared on a successful checkout/renewal.
+  autoUpgradeBlockedAt  BigInt?
+
+  invoices Invoice[]
+
+  createdAt BigInt
+  updatedAt BigInt
+
+  // One current subscription row per org (lifecycle is in-place upsert).
+  @@unique([organizationId])
+  @@index([organizationId, status])
+  @@index([planId])
+}
+
+// Emulated billing invoice (one per charge). No real gateway.
+model Invoice {
+  id             String  @id @default(uuid())
+  organizationId String
+  subscriptionId String?
+  number         String  @unique
+  planName       String
+
+  // Money. Plan prices are TAX-EXCLUSIVE: `amount` is the net (subtotal),
+  // `taxAmount` is the 10% Japanese consumption tax, `totalAmount` is what the
+  // customer actually pays. Kept as separate columns because the qualified
+  // invoice (適格請求書) must itemise tax.
+  amount      Float // subtotal, tax-exclusive
+  taxAmount   Float  @default(0)
+  taxPercent  Float  @default(10)
+  totalAmount Float  @default(0)
+  currency    String @default("JPY")
+
+  status String @default("PAID") // PENDING | PAID | FAILED
+
+  // UNIQUE — this is the dedupe lock for "activate this period exactly once".
+  // The webhook and the success-redirect fallback can both fire for the same
+  // payment (and Stripe retries webhooks), so a check-then-insert would race.
+  // The DB rejects the second insert (P2002) and the caller treats it as a
+  // duplicate. Postgres allows many NULLs in a unique index, so legacy/pending
+  // invoices without a ref are unaffected.
+  paymentRef String? @unique
+
+  // Stripe linkage (async konbini payments land here before they're PAID).
+  stripePaymentIntentId String?
+  stripeInvoiceId       String?
+  paymentMethod         PaymentMethodType?
+
+  periodStart BigInt
+  periodEnd   BigInt
+  createdAt   BigInt
+
+  organization Organization              @relation(fields: [organizationId], references: [id])
+  subscription OrganizationSubscription? @relation(fields: [subscriptionId], references: [id])
+
+  @@index([organizationId])
+  @@index([subscriptionId])
+}
+
+// User — single table for all roles (SUPER_ADMIN, NPO_ADMIN, COORDINATOR, STAFF, GUARDIAN, PARTICIPANT)
+enum UserRole {
+  SUPER_ADMIN
+  NPO_ADMIN
+  COORDINATOR
+  STAFF
+  GUARDIAN
+  PARTICIPANT
+}
+
+model User {
+  id                    String       @id @default(uuid())
+  fullName              String
+  // Japanese phonetic name (カナ) — shown in reports alongside fullName
+  nameKana              String?
+  email                 String       @unique
+  password              String
+  // Human-friendly per-org code shown in reports: S001 for staff, P001 for
+  // participants (allocated from Organization.staffSeq/participantSeq).
+  userCode              String?
+  // Small avatar stored as a data-URL (client resizes to ≤256px before upload)
+  profileImage          String?
+  phone                 String?
+  emergencyContactPhone String?
+  role                  UserRole
+  dateOfJoining         BigInt?
+  dateOfBirth           BigInt?
+  designationId         String?
+  serviceType           ServiceType?
+  organizationId        String?
+
+  // Staff contract settings (drive the attendance forecast): expected hours
+  // per working day and which weekdays they work (0=Sun … 6=Sat).
+  contractedHoursPerDay Float?
+  workingDays           Int[]  @default([1, 2, 3, 4, 5])
+
+  status    Boolean @default(true)
+  createdBy String?
+  address   String?
+
+  isLoggedIn     Boolean @default(false)
+  loginAt        BigInt?
+  logoutAt       BigInt?
+  lastActivityAt BigInt?
+  isDeleted      Boolean @default(false)
+
+  // Self-service password reset
+  resetToken       String?
+  resetTokenExpiry BigInt?
+
+  // Email verification (self-signup). Null = unverified; timestamp = when verified.
+  emailVerifiedAt   BigInt?
+  verifyToken       String?
+  verifyTokenExpiry BigInt?
+
+  // Explicit opt-in for sharing live position during an in-progress task.
+  // Separate from the phone's OS permission on purpose: the OS grant is a
+  // device setting the org can talk someone into, this is the person's own
+  // recorded consent, and BOTH must be true before any fix is accepted.
+  consentLocationSharing Boolean @default(false)
+
+  // Guardian → Participant self-relation (used for GUARDIAN/PARTICIPANT roles)
+  guardianUserId         String?
+  guardianUser           User?   @relation("GuardianParticipants", fields: [guardianUserId], references: [id])
+  participantsAsGuardian User[]  @relation("GuardianParticipants")
+
+  // Fields used when role = GUARDIAN
+  relationshipType String?
+  alternatePhone   String?
+  city             String?
+  state            String?
+  country          String?
+  postalCode       String?
+
+  // Fields used when role = PARTICIPANT
+  gender                String?
+  medicalNotes          String?
+  allergyNotes          String?
+  mobilitySupport       Boolean @default(false)
+  // Wheelchair need is separate from transport need — vehicle matching uses this.
+  needsWheelchair       Boolean @default(false)
+  emergencyInstructions String?
+  participantStatus     String? // ACTIVE | INACTIVE | WAITLISTED | BLOCKED (for participants only)
+
+  createdAt BigInt
+  updatedAt BigInt
+
+  organization           Organization?            @relation(fields: [organizationId], references: [id])
+  designation            StaffRole?               @relation(fields: [designationId], references: [id])
+  BookingStaffAssignment BookingStaffAssignment[]
+  staffAttendances       StaffAttendance[]
+
+  // Booking relations — named to avoid ambiguity
+  bookingsAsGuardian    Booking[] @relation("BookingGuardian")
+  bookingsAsParticipant Booking[] @relation("BookingParticipant")
+
+  // New module relations
+  availabilities    StaffAvailability[]
+  reportedIncidents Incident[]          @relation("IncidentReporter")
+  resolvedIncidents Incident[]          @relation("IncidentResolver")
+
+  // Daily contact-book reports (連絡帳)
+  dailyReportsAsParticipant DailyReport[] @relation("DailyReportParticipant")
+  dailyReportsAsGuardian    DailyReport[] @relation("DailyReportGuardian")
+  dailyReportsAsStaff       DailyReport[] @relation("DailyReportStaff")
+  auditLogs         AuditLog[]
+  notifications     Notification[]
+  deviceTokens      DeviceToken[]
+
+  // Documents (participant files, waivers, care plans)
+  participantDocuments Document[] @relation("DocumentParticipant")
+  uploadedDocuments    Document[] @relation("DocumentUploader")
+  consentedDocuments   Document[] @relation("DocumentConsenter")
+  // Compliance paperwork owned by this staff member (licence, certifications)
+  ownedDocuments       Document[] @relation("DocumentOwner")
+
+  // Account deletion (Google Play requires a self-service path)
+  deletionRequests         AccountDeletionRequest[] @relation("DeletionRequester")
+  handledDeletionRequests  AccountDeletionRequest[] @relation("DeletionHandler")
+
+  @@index([organizationId, role, isDeleted])
+  @@index([organizationId, status])
+  @@index([designationId])
+  @@index([guardianUserId])
+}
+
+enum DeletionRequestStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+/// Self-service account deletion. Google Play requires any app that lets a
+/// user create an account to offer an in-app deletion path plus a public URL.
+///
+/// It is a REQUEST, not an immediate delete: welfare organizations are legally
+/// required to keep records of the care and transport they provided, so the
+/// org's administrator reviews it and approval anonymises the person rather
+/// than dropping the rows that those records hang off.
+model AccountDeletionRequest {
+  id             String                @id @default(uuid())
+  organizationId String?
+  userId         String
+  status         DeletionRequestStatus  @default(PENDING)
+  reason         String?
+  // Administrator's note when approving or rejecting.
+  decisionNote   String?
+  handledById    String?
+  handledAt      BigInt?
+  createdAt      BigInt
+  updatedAt      BigInt
+
+  user      User          @relation("DeletionRequester", fields: [userId], references: [id])
+  handledBy User?         @relation("DeletionHandler", fields: [handledById], references: [id])
+
+  @@index([organizationId, status])
+  @@index([userId, status])
+}
+
+// Service
+model Service {
+  id                String       @id @default(uuid())
+  organizationId    String
+  category          ServiceType?
+  serviceName       String
+  // Japanese display name, printed alongside EN in reports (e.g. 余暇支援「ろいく」)
+  serviceNameJa     String?
+  defaultCapacity   Int
+  durationMinutes   Int
+  description       String?
+  requiresTransport Boolean      @default(false)
+  requiresStaff     Boolean      @default(true)
+  slotTemplates     Json?
+
+  // One-participant transport (e.g. elderly "taxi" service): a booking covers a
+  // single specific person point-to-point, so the booking flow locks the count
+  // to 1 and the UI marks it as private transport (client #6).
+  singleParticipant Boolean      @default(false)
+
+  // Minimum staffing configuration (SOW §11) — validated before booking approval.
+  // Flat minimums always apply; the ratio adds staff per block of participants,
+  // e.g. ratioParticipantsPer=10, ratioSupportStaff=2, ratioDrivers=1 →
+  // "every 10 children need 2 support workers + 1 driver". Required count for a
+  // role = max(flatMin, ceil(participantCount / ratioParticipantsPer) * ratioPer).
+  minSupportStaff      Int  @default(0)
+  minDrivers           Int  @default(0)
+  minAssistants        Int  @default(0)
+  ratioParticipantsPer Int? // block size (the "N"); null = no ratio, flat min only
+  ratioSupportStaff    Int  @default(0)
+  ratioDrivers         Int  @default(0)
+  ratioAssistants      Int  @default(0)
+  maxParticipants      Int? // per-service participant cap (SOW §11); null = no cap
+
+  // Recreation ("あそびの会ロイク") and similar outings can require a parent or
+  // guardian to attend with the participant. When true the booking flow makes
+  // the guardian answer, and a booking that answers "no" is blocked.
+  requiresGuardianAccompaniment Boolean @default(false)
+
+  status            Boolean      @default(true)
+  isDeleted         Boolean      @default(false)
+  createdAt         BigInt
+  updatedAt         BigInt
+
+  organization Organization  @relation(fields: [organizationId], references: [id])
+  slots        ServiceSlot[]
+
+  @@index([organizationId, isDeleted])
+}
+
+// StaffRole
+model StaffRole {
+  id          String        @id @default(uuid())
+  name        String
+  description String?
+  serviceType ServiceType?
+  roleType    StaffRoleType @default(OTHER)
+  createdBy   String
+  status      Boolean       @default(true)
+  createdAt   BigInt
+  updatedAt   BigInt
+
+  users          User[]
+  Organization   Organization? @relation(fields: [organizationId], references: [id])
+  organizationId String?
+
+  @@index([organizationId])
+}
+
+// Vehicle
+model Vehicle {
+  id                   String       @id @default(uuid())
+  organizationId       String
+  serviceType          ServiceType?
+  vehicleName          String
+  vehicleNumber        String
+  vehicleType          String
+  capacity             Int
+  wheelchairCapacity   Int?
+  wheelchairAccessible Boolean      @default(false)
+  status               Boolean      @default(true)
+  isDeleted            Boolean      @default(false)
+  GPSId                String?
+  Notes                String?
+  createdBy            String?
+  equipmentDetails     String[]
+  createdAt            BigInt
+  updatedAt            BigInt
+
+  organization Organization       @relation(fields: [organizationId], references: [id])
+  bookings     Booking[]
+  operations   VehicleOperation[]
+  // Compliance paperwork (車検証, insurance, registration)
+  documents    Document[]
+
+  // Plate numbers are unique per organization, not globally (multi-tenant).
+  @@unique([organizationId, vehicleNumber])
+  @@index([organizationId])
+}
+
+// VehicleOperation — monthly per-vehicle operations & cost record.
+// Trip counts can be seeded from dispatch; fuel/maintenance/insurance are
+// manual monthly input. Costs stored as integer yen (¥, no decimals).
+model VehicleOperation {
+  id              String  @id @default(uuid())
+  organizationId  String
+  vehicleId       String
+  month           Int // 1-12
+  year            Int
+  totalTrips      Int     @default(0)
+  totalKm         Int     @default(0)
+  fuelCost        Int     @default(0)
+  maintenanceCost Int     @default(0)
+  insuranceCost   Int     @default(0)
+  notes           String?
+  createdBy       String?
+  createdAt       BigInt
+  updatedAt       BigInt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  vehicle      Vehicle      @relation(fields: [vehicleId], references: [id])
+
+  // One record per vehicle per month — upsert target.
+  @@unique([vehicleId, month, year])
+  @@index([organizationId, year, month])
+}
+
+// Venue
+model Venue {
+  id                String       @id @default(uuid())
+  organizationId    String
+  name              String
+  address           String
+  // Geocoded ON DEMAND and cached here (same pattern as Booking.pickupLat) — a
+  // venue address is stable, so it is only ever looked up once.
+  lat               Float?
+  lng               Float?
+  capacity          Int
+  serviceType       ServiceType?
+  contactPerson     String?
+  contactPhone      String?
+  availableCapacity Int?
+  status            Boolean      @default(true)
+  isOccupied        Boolean      @default(false)
+  isDeleted         Boolean      @default(false)
+  createdBy         String?
+  createdAt         BigInt
+  updatedAt         BigInt
+
+  organization Organization  @relation(fields: [organizationId], references: [id])
+  bookings     Booking[]
+  slots        ServiceSlot[]
+
+  documents Document[]
+
+  @@index([organizationId])
+}
+
+// Booking
+enum BookingStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+  COMPLETED
+  WAITLISTED
+}
+
+enum RecurrenceFrequency {
+  DAILY
+  WEEKLY
+}
+
+model Booking {
+  id                 String        @id @default(uuid())
+  // Human-friendly sequential code per org (e.g. BK0011). Nullable for legacy
+  // rows before backfill; assigned atomically on create via Organization.bookingSeq.
+  bookingCode        String?
+  organizationId     String
+  participantId      String
+  guardianId         String
+  serviceType        ServiceType
+  venueId            String?
+  vehicleId          String?
+  bookingDate        BigInt
+  startTime          BigInt
+  endTime            BigInt
+  requiredSeats      Int           @default(1)
+  participantCount   Int           @default(1)
+  pickupAddress      String?
+  pickupLat          Float?
+  pickupLng          Float?
+  // Answer to the guardian-accompaniment question when the service requires it
+  // (null = the service never asked). Validated on create, not just recorded.
+  guardianAccompanying Boolean?
+  purpose            String?
+  notes              String?
+  status             BookingStatus @default(PENDING)
+  cancellationReason String?
+  operationalNotes   String?
+  createdAt          BigInt
+  updatedAt          BigInt
+  approvedBy         String?
+
+  // Scheduling
+  slotId String?
+
+  // Recurring booking
+  isRecurring       Boolean @default(false)
+  recurrenceGroupId String?
+  recurrenceRule    Json?
+
+  // Reminder cron: set when a pre-start reminder has been sent (dedupe)
+  reminderSentAt BigInt?
+  // Which org-configured reminder intervals (hours-before) already fired for
+  // this booking — dedupes multi-interval reminders (e.g. [168, 48, 24]).
+  remindersSent  Int[]   @default([])
+
+  organization     Organization             @relation(fields: [organizationId], references: [id])
+  participant      User                     @relation("BookingParticipant", fields: [participantId], references: [id])
+  guardian         User                     @relation("BookingGuardian", fields: [guardianId], references: [id])
+  venue            Venue?                   @relation(fields: [venueId], references: [id])
+  vehicle          Vehicle?                 @relation(fields: [vehicleId], references: [id])
+  slot             ServiceSlot?             @relation(fields: [slotId], references: [id])
+  staffAssignments BookingStaffAssignment[]
+  incidents        Incident[]
+
+  documents    Document[]
+  dailyReports DailyReport[]
+
+  @@unique([organizationId, bookingCode])
+  @@index([organizationId, status])
+  @@index([organizationId, bookingDate])
+  @@index([participantId])
+  @@index([guardianId])
+  @@index([slotId])
+  @@index([vehicleId])
+  @@index([venueId])
+  @@index([recurrenceGroupId])
+}
+
+// BookingStaffAssignment
+model BookingStaffAssignment {
+  id                 String  @id @default(uuid())
+  bookingId          String
+  userId             String
+  assignmentRole     String
+  status             String  @default("PENDING_ACCEPTANCE")
+  assignedBy         String?
+  assignedAt         BigInt?
+  remarks            String?
+  // Staff acknowledgement — soft accept/decline gate before a task can START.
+  acceptedAt         BigInt?
+  declinedAt         BigInt?
+  declineReason      String?
+  startedAt          BigInt?
+  cancellationReason String?
+  endedAt            BigInt?
+  completedAt        BigInt?
+  createdAt          BigInt
+  updatedAt          BigInt
+  organizationId     String
+
+  // Live location — LAST KNOWN ONLY, deliberately not a ping history.
+  // Tracking a staff member is employee surveillance: we keep one row that is
+  // overwritten, it is only written while the assignment is START, and it is
+  // wiped the moment the task ends (see clearLocation in the service). There is
+  // no route history to leak, subpoena, or grow unboundedly.
+  lastLat        Float?
+  lastLng        Float?
+  lastLocationAt BigInt?
+
+  // The FINAL position captured when the task ended — a single point ("the trip
+  // finished here"), NOT a trail. Unlike the live fields above, this is kept so a
+  // manager can later see where a completed task actually ended.
+  endLat         Float?
+  endLng         Float?
+  endLocationAt  BigInt?
+
+  booking      Booking      @relation(fields: [bookingId], references: [id])
+  user         User         @relation(fields: [userId], references: [id])
+  organization Organization @relation(fields: [organizationId], references: [id])
+
+  @@index([bookingId])
+  @@index([userId])
+  @@index([organizationId])
+}
+
+// StaffAttendance
+model StaffAttendance {
+  id                  String  @id @default(uuid())
+  organizationId      String
+  userId              String
+  serviceType         String?
+  attendanceDate      BigInt
+  checkInAt           BigInt?
+  checkInLatitude     Float?
+  checkInLongitude    Float?
+  checkInAddress      String?
+  checkOutAt          BigInt?
+  checkOutLatitude    Float?
+  checkOutLongitude   Float?
+  checkOutAddress     String?
+  totalWorkingMinutes Int     @default(0)
+  overtimeMinutes     Int     @default(0)
+  attendanceStatus    String  @default("CHECKED_IN") // CHECKED_IN|CHECKED_OUT|LEAVE|HALF_DAY
+  leaveReason         String?
+  // Structured operational remark tag (SOW §12): ON_LEAVE | EMERGENCY_ABSENCE |
+  // REDUCED_HOURS | SHIFT_REPLACEMENT | SICK_LEAVE | HALF_DAY. Free-text stays in remarks.
+  operationalRemark   String?
+  isDeleted           Boolean @default(false)
+  remarks             String?
+  createdAt           BigInt
+  updatedAt           BigInt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  user         User         @relation(fields: [userId], references: [id])
+
+  @@index([organizationId, isDeleted])
+  @@index([userId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// ServiceSlot — scheduled time slots for a service, with capacity tracking
+// ─────────────────────────────────────────────────────────────────────────
+model ServiceSlot {
+  id             String      @id @default(uuid())
+  organizationId String
+  serviceId      String
+  venueId        String?
+  serviceType    ServiceType
+  slotDate       BigInt
+  startTime      BigInt
+  endTime        BigInt
+  capacity       Int
+  bookedCount    Int         @default(0)
+  status         Boolean     @default(true)
+  isDeleted      Boolean     @default(false)
+  notes          String?
+  createdBy      String?
+  createdAt      BigInt
+  updatedAt      BigInt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  service      Service      @relation(fields: [serviceId], references: [id])
+  venue        Venue?       @relation(fields: [venueId], references: [id])
+  bookings     Booking[]
+
+  @@index([organizationId, isDeleted])
+  @@index([serviceId])
+  @@index([venueId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Incident — operational issues (delays, medical, breakdown, no-show)
+// ─────────────────────────────────────────────────────────────────────────
+enum IncidentType {
+  DELAY
+  MEDICAL
+  VEHICLE_BREAKDOWN
+  NO_SHOW
+  OTHER
+}
+
+enum IncidentSeverity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum IncidentStatus {
+  OPEN
+  IN_PROGRESS
+  RESOLVED
+}
+
+model Incident {
+  id              String           @id @default(uuid())
+  organizationId  String
+  bookingId       String?
+  reportedBy      String
+  type            IncidentType
+  severity        IncidentSeverity @default(MEDIUM)
+  status          IncidentStatus   @default(OPEN)
+  title           String
+  description     String?
+  resolutionNotes String?
+  resolvedBy      String?
+  resolvedAt      BigInt?
+  isDeleted       Boolean          @default(false)
+  createdAt       BigInt
+  updatedAt       BigInt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  booking      Booking?     @relation(fields: [bookingId], references: [id])
+  reporter     User         @relation("IncidentReporter", fields: [reportedBy], references: [id])
+  resolver     User?        @relation("IncidentResolver", fields: [resolvedBy], references: [id])
+
+  documents Document[]
+
+  @@index([organizationId, status, isDeleted])
+  @@index([bookingId])
+  @@index([reportedBy])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// DailyReport — the per-participant daily contact book (連絡帳) a staff member
+// fills after a service. Finalizing it notifies ONLY that participant's guardian.
+// ─────────────────────────────────────────────────────────────────────────
+enum DailyReportStatus {
+  DRAFT
+  FINALIZED
+}
+
+model DailyReport {
+  id             String            @id @default(uuid())
+  organizationId String
+  bookingId      String? // the service this report covers, when tied to one
+  participantId  String // who the report is about (User with role PARTICIPANT)
+  guardianId     String? // recipient guardian (User) — resolved from the booking/participant
+  staffId        String // author (User)
+
+  reportDate BigInt // the service day this report covers (Unix ms)
+
+  // Wellbeing
+  vigorLevel Int? // 1..5 (元気度)
+  states     String[] // multi-select 気持ち・状態: CALM/TIRED/ANXIOUS/…
+
+  // Vitals & sleep
+  bodyTemp     Float? // 体温 °C
+  bedtime      String? // 就寝時刻 "HH:MM"
+  wakeTime     String? // 起床時刻 "HH:MM"
+  nightWakings String? // 夜中に起きた回数: NONE | ONCE | TWICE_PLUS
+
+  // Belongings brought (持ち物チェック)
+  belongings String[] // CHANGE_OF_CLOTHES/LUNCH_BAG/TOOTHBRUSH/DIAPERS/PADS/INDOOR_SHOES
+
+  // Transport (送迎)
+  pickup  String? // BUS | GUARDIAN | DAY_SERVICE | OTHER
+  dropoff String?
+
+  notes String? // ひとことメモ
+
+  status      DailyReportStatus @default(DRAFT)
+  finalizedAt BigInt?
+  isDeleted   Boolean           @default(false)
+  createdAt   BigInt
+  updatedAt   BigInt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  booking      Booking?     @relation(fields: [bookingId], references: [id])
+  participant  User         @relation("DailyReportParticipant", fields: [participantId], references: [id])
+  guardian     User?        @relation("DailyReportGuardian", fields: [guardianId], references: [id])
+  staff        User         @relation("DailyReportStaff", fields: [staffId], references: [id])
+
+  @@index([organizationId, status, isDeleted])
+  @@index([participantId])
+  @@index([guardianId])
+  @@index([staffId])
+  @@index([bookingId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// AuditLog — immutable record of mutating actions across the platform
+// ─────────────────────────────────────────────────────────────────────────
+model AuditLog {
+  id             String  @id @default(uuid())
+  organizationId String?
+  actorId        String?
+  actorRole      String?
+  action         String // CREATE | UPDATE | DELETE | STATUS_CHANGE | OVERRIDE
+  entity         String // e.g. "Booking", "Vehicle"
+  entityId       String?
+  before         Json?
+  after          Json?
+  metadata       Json?
+  createdAt      BigInt
+
+  organization Organization? @relation(fields: [organizationId], references: [id])
+  actor        User?         @relation(fields: [actorId], references: [id])
+
+  @@index([organizationId, entity, action])
+  @@index([actorId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// StaffAvailability — windows when a staff member is unavailable
+// ─────────────────────────────────────────────────────────────────────────
+model StaffAvailability {
+  id             String  @id @default(uuid())
+  organizationId String
+  userId         String
+  startTime      BigInt
+  endTime        BigInt
+  reason         String?
+  isDeleted      Boolean @default(false)
+  createdAt      BigInt
+  updatedAt      BigInt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  user         User         @relation(fields: [userId], references: [id])
+
+  @@index([organizationId, isDeleted])
+  @@index([userId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Notification — in-app notifications (paired with email where relevant)
+// ─────────────────────────────────────────────────────────────────────────
+model Notification {
+  id                   String  @id @default(uuid())
+  organizationId       String
+  userId               String
+  title                String
+  message              String
+  type                 String
+  relatedBookingId     String?
+  relatedParticipantId String?
+  isRead               Boolean @default(false)
+  createdAt            BigInt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  user         User         @relation(fields: [userId], references: [id])
+
+  @@index([userId, isRead])
+  @@index([organizationId])
+}
+
+// DeviceToken — Expo push tokens for the mobile app (one row per install).
+// A user may sign in on several devices, so the UNIQUE key is the token itself,
+// not the user. Rows are pruned when Expo reports DeviceNotRegistered and on
+// logout, so a stale install never keeps receiving another user's alerts.
+model DeviceToken {
+  id             String  @id @default(uuid())
+  userId         String
+  organizationId String
+  token          String  @unique
+  platform       String? // "ios" | "android"
+  createdAt      BigInt
+  updatedAt      BigInt
+
+  user         User         @relation(fields: [userId], references: [id])
+  organization Organization @relation(fields: [organizationId], references: [id])
+
+  @@index([userId])
+  @@index([organizationId])
+}
+
+// Document — participant/org files stored in Backblaze B2 (S3-compatible).
+// Only the object KEY is persisted; the file itself never touches our DB and is
+// served via short-lived signed URLs (bucket stays private).
+enum DocumentType {
+  // Participant paperwork
+  WAIVER
+  CONSENT
+  CARE_PLAN
+  MEDICAL
+
+  // Compliance paperwork — these carry an `expiresAt` and gate operations:
+  // an expired DRIVING_LICENCE blocks assigning that staff member as a DRIVER,
+  // and an expired VEHICLE_INSPECTION (車検) blocks dispatching that vehicle.
+  DRIVING_LICENCE
+  CERTIFICATION // nurse licence, first-aid, etc.
+  VEHICLE_INSPECTION // 車検証
+  INSURANCE
+  REGISTRATION
+
+  // Evidence + extras
+  PHOTO // incident photos (damage, breakdown), venue photos
+  FLOOR_PLAN
+  ATTACHMENT // guardian's booking attachments (medical note, route map)
+
+  OTHER
+}
+
+model Document {
+  id             String       @id @default(uuid())
+  organizationId String
+  type           DocumentType @default(OTHER)
+
+  // Exactly one owner (or none, for an org-level file) — enforced in the
+  // service. A document belongs to a participant (care plans/waivers), a staff
+  // member (licences), a vehicle (車検証), an incident (evidence photos), a
+  // venue (photos/floor plan) or a booking (guardian attachments).
+  participantId String?
+  userId        String? // staff member the certificate belongs to
+  vehicleId     String?
+  incidentId    String?
+  venueId       String?
+  bookingId     String?
+
+  // Compliance expiry. When set and in the past, the document is EXPIRED and
+  // the operation it gates is blocked (driver assignment / vehicle dispatch).
+  expiresAt BigInt?
+
+  fileKey  String // B2 object key (never exposed raw to clients)
+  fileName String
+  mimeType String
+  size     Int    @default(0)
+
+  // Consent: a guardian ticks to accept (waivers/consent forms).
+  consentRequired Boolean @default(false)
+  consentGivenAt  BigInt?
+  consentBy       String?
+
+  uploadedBy String?
+  isDeleted  Boolean @default(false)
+  createdAt  BigInt
+  updatedAt  BigInt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  participant  User?        @relation("DocumentParticipant", fields: [participantId], references: [id])
+  owner        User?        @relation("DocumentOwner", fields: [userId], references: [id])
+  vehicle      Vehicle?     @relation(fields: [vehicleId], references: [id])
+  incident     Incident?    @relation(fields: [incidentId], references: [id])
+  venue        Venue?       @relation(fields: [venueId], references: [id])
+  booking      Booking?     @relation(fields: [bookingId], references: [id])
+  uploader     User?        @relation("DocumentUploader", fields: [uploadedBy], references: [id])
+  consenter    User?        @relation("DocumentConsenter", fields: [consentBy], references: [id])
+
+  @@index([organizationId, isDeleted])
+  @@index([participantId])
+  @@index([userId])
+  @@index([vehicleId])
+  @@index([incidentId])
+  @@index([venueId])
+  @@index([bookingId])
+  // Compliance sweep scans by expiry within an org.
+  @@index([organizationId, type, expiresAt])
+}

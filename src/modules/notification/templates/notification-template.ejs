@@ -1,0 +1,146 @@
+<%
+  // Defensive locals — never throw on a missing variable
+  var title           = locals.title || "Notification";
+  var name            = locals.name || "there";
+  var message         = locals.message || "";
+  var participantName = locals.participantName;
+  var serviceType     = locals.serviceType;
+  var schedule        = locals.schedule;
+  var pickupAddress   = locals.pickupAddress;
+  var bookingCode     = locals.bookingCode;
+  var reason          = locals.reason;
+  var actionUrl       = locals.actionUrl;
+  var actionText      = locals.actionText || (actionUrl ? "View Details" : null);
+  var eyebrow         = locals.eyebrow;
+  var brand           = locals.brand || "SHINY - SOMS";
+  var tagline         = locals.tagline || "SCHEDULING AND OPERATIONS MANAGEMENT SYSTEM";
+  var year            = locals.year || "";
+  // Logo: prefer the CID attachment (always renders — no dependency on
+  // FRONTEND_URL being publicly reachable, and not blocked as a remote image).
+  // Falls back to a hosted PNG, then to the amber brand box.
+  var frontendUrl     = (locals.frontendUrl || (typeof process !== "undefined" && process.env && process.env.FRONTEND_URL) || "").replace(/\/+$/, "");
+  var logoCid         = locals.logoCid;
+  var logoSrc         = logoCid ? "cid:" + logoCid : (locals.logoUrl || (frontendUrl ? frontendUrl + "/shiny-logo.png" : ""));
+%>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title><%= title %></title>
+</head>
+<body style="margin:0; padding:0; background:#f3ede1; font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif; color:#1b2230;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f3ede1; padding:32px 12px;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="max-width:600px; width:100%; background:#ffffff; border:1px solid #ece3d3; border-radius:18px; overflow:hidden; box-shadow:0 6px 20px rgba(27,34,48,0.08);">
+
+          <!-- Header: centered logo lockup on a warm band -->
+          <tr>
+            <td align="center" style="padding:30px 30px 24px; background:#fbf8f2; text-align:center;">
+              <% if (logoSrc) { %>
+                <img src="<%= logoSrc %>" alt="<%= brand %>" width="72" height="72" style="display:inline-block; width:72px; height:72px; border:0; outline:none;" />
+              <% } else { %>
+                <span style="display:inline-block; width:72px; height:72px; background:linear-gradient(135deg,#fbbf24,#f59e0b); border-radius:18px;"></span>
+              <% } %>
+              <div style="font-size:19px; font-weight:800; color:#1b2230; letter-spacing:0.4px; margin-top:14px;"><%= brand %></div>
+              <% if (tagline) { %>
+              <div style="font-size:9px; font-weight:700; color:#0e7c66; letter-spacing:1.6px; text-transform:uppercase; margin-top:5px;"><%= tagline %></div>
+              <% } %>
+            </td>
+          </tr>
+          <!-- Brand accent bar (replaces the old side rail) -->
+          <tr>
+            <td style="height:4px; line-height:4px; font-size:0; background:linear-gradient(90deg,#fbbf24,#d97706 55%,#0e7c66);">&nbsp;</td>
+          </tr>
+
+          <!-- Body -->
+          <tr>
+            <td style="padding:30px;">
+
+                    <% if (eyebrow) { %>
+                    <p style="margin:0 0 8px; font-size:11px; font-weight:800; letter-spacing:1.4px; text-transform:uppercase; color:#0e7c66;"><%= eyebrow %></p>
+                    <% } %>
+                    <h1 style="margin:0 0 16px; font-size:22px; font-weight:800; color:#1b2230; letter-spacing:-0.3px;"><%= title %></h1>
+
+                    <p style="margin:0 0 8px; font-size:15px; color:#1b2230;">Hello <%= name %>,</p>
+                    <p style="margin:0 0 22px; font-size:14px; line-height:1.6; color:#4a4436;"><%= message %></p>
+
+                    <%
+                      // NOTE: do not name this `details`. EJS compiles to
+                      // `with (locals)`, so assigning to a name the caller also
+                      // passes in (emailData.details) writes straight through to
+                      // locals.details and clobbers the caller's rows.
+                      var extraRows = Array.isArray(locals.details) ? locals.details : [];
+
+                      var detailRows = [];
+                      if (participantName) detailRows.push(["Participant", participantName]);
+                      if (serviceType)     detailRows.push(["Service", serviceType]);
+                      if (schedule)        detailRows.push(["Date & time", schedule]);
+                      if (pickupAddress)   detailRows.push(["Pickup", pickupAddress]);
+                      if (bookingCode)     detailRows.push(["Booking ID", bookingCode]);
+
+                      // Domain-specific rows any caller may add via
+                      // emailData.details = [[label, value], …] (incident
+                      // severity, plan + amount, document expiry, …).
+                      extraRows.forEach(function (row) {
+                        if (!row) return;
+                        var label = Array.isArray(row) ? row[0] : row.label;
+                        var value = Array.isArray(row) ? row[1] : row.value;
+                        if (label && value !== undefined && value !== null && value !== "") {
+                          detailRows.push([label, value]);
+                        }
+                      });
+
+                      // Reason reads as a closing remark — keep it last.
+                      if (reason) detailRows.push(["Reason", reason]);
+                    %>
+                    <% if (detailRows.length) { %>
+                    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 24px;">
+                      <% detailRows.forEach(function(d, i){ %>
+                      <tr>
+                        <td style="padding:10px 0; font-size:12px; color:#6c6353; font-weight:700; width:130px; vertical-align:top; <%= i < detailRows.length - 1 ? 'border-bottom:1px solid #f0e8d8;' : '' %>"><%= d[0] %></td>
+                        <td style="padding:10px 0; font-size:14px; color:#1b2230; <%= i < detailRows.length - 1 ? 'border-bottom:1px solid #f0e8d8;' : '' %>"><%= d[1] %></td>
+                      </tr>
+                      <% }); %>
+                    </table>
+                    <% } %>
+
+                    <% if (actionUrl && actionText) { %>
+                    <table role="presentation" cellpadding="0" cellspacing="0" style="margin:4px 0;">
+                      <tr>
+                        <td style="border-radius:12px; background:#1b2230;">
+                          <a href="<%= actionUrl %>" target="_blank"
+                             style="display:inline-block; padding:13px 28px; font-size:14px; font-weight:700; color:#ffffff; text-decoration:none; border-radius:12px;">
+                            <%= actionText %> &rarr;
+                          </a>
+                        </td>
+                      </tr>
+                    </table>
+                    <p style="margin:16px 0 0; font-size:12px; color:#b6ab98; word-break:break-all;">
+                      Or paste this link into your browser:<br /><%= actionUrl %>
+                    </p>
+                    <% } %>
+
+            </td>
+          </tr>
+
+          <!-- Footer -->
+          <tr>
+            <td style="padding:18px 26px; background:#fbf8f2; border-top:1px solid #ece3d3;">
+              <p style="margin:0 0 4px; font-size:12px; font-weight:800; color:#1b2230;"><%= brand %></p>
+              <% if (tagline) { %>
+              <p style="margin:0 0 8px; font-size:10px; font-weight:700; color:#0e7c66; letter-spacing:1px; text-transform:uppercase;"><%= tagline %></p>
+              <% } %>
+              <p style="margin:0; font-size:11px; color:#b6ab98; line-height:1.5;">
+                This is an automated message<%= year ? " · © " + year : "" %> <%= brand %>. Please do not reply to this email.
+              </p>
+            </td>
+          </tr>
+
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>

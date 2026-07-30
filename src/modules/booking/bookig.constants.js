@@ -1,0 +1,68 @@
+const BOOKING_STATUS = {
+  PENDING: "PENDING",
+
+  APPROVED: "APPROVED",
+
+  REJECTED: "REJECTED",
+
+  COMPLETED: "COMPLETED",
+
+  CANCELLED: "CANCELLED",
+
+  WAITLISTED: "WAITLISTED",
+};
+
+const BOOKING_ASSIGNMENT_STATUS = {
+  ASSIGNED: "ASSIGNED",
+
+  START: "START",
+
+  END: "END",
+
+  COMPLETED: "COMPLETED",
+};
+
+const ASSIGNMENT_ROLES = {
+  DRIVER: "DRIVER",
+
+  TEACHER: "TEACHER",
+
+  SUPPORT_STAFF: "SUPPORT_STAFF",
+
+  RECREATION_STAFF: "RECREATION_STAFF",
+};
+
+const OPERATIONAL_WARNINGS = {
+  VEHICLE_UNAVAILABLE:
+    "Vehicle unavailable",
+
+  DRIVER_UNAVAILABLE:
+    "Driver unavailable",
+
+  VEHICLE_CAPACITY_FULL:
+    "Vehicle capacity full",
+
+  INSUFFICIENT_TEACHERS:
+    "Insufficient teachers",
+
+  INSUFFICIENT_RECREATION_STAFF:
+    "Insufficient recreation staff",
+
+  VENUE_UNAVAILABLE:
+    "Venue unavailable",
+
+  STAFF_UNAVAILABLE:
+    "Staff unavailable",
+};
+
+module.exports = {
+  BOOKING_STATUS,
+
+  BOOKING_ASSIGNMENT_STATUS,
+
+  ASSIGNMENT_ROLES,
+
+  OPERATIONAL_WARNINGS,
+};
+
+

@@ -1,0 +1,5 @@
+const STAFF_MANAGEMENT_ROLES = ["NPO_ADMIN", "COORDINATOR"];
+
+module.exports = {
+  STAFF_MANAGEMENT_ROLES,
+};
